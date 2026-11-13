@@ -109,39 +109,39 @@ class StatusMonitor(TrafficStats, logging.Handler):
         while True:
             await asyncio.sleep(self.interval)
 
-            # Clear the console
-            if "Pythonista" in sys.executable:
-                console.clear()
-            else:
-                print("\033c", end="")
-
-            print(self.banner)
-
             inbound_average, inbound_total = self.inbound.update()
             outbound_average, outbound_total = self.outbound.update()
             megabit = 1024 * 1024 / 8
             megabyte = 1024 * 1024
 
-            # Print the table
-            print(f"{'Direction':<12} | {'Traffic (Mbps)':<15}")
-            print(f"{'-'*12} | {'-'*15}")
-            print(f"{'In':<12} | {inbound_average / megabit:<15.2f}")
-            print(f"{'Out':<12} | {outbound_average / megabit:<15.2f}")
-            # Print a blank line
-            print()
-            print(f"{'Connections:':<12} {self.num_connections:>6}")
-            print(f"{'Total In:':<12} {inbound_total / megabyte:>6.2f} MB")
-            print(f"{'Total Out:':<12} {outbound_total / megabyte:>6.2f} MB")
-            print(
-                f"{'Total:':<12} {(inbound_total + outbound_total) / megabyte:>6.2f} MB"
-            )
-            print()
+            lines = [
+                self.banner,
+                f"{'Direction':<12} | {'Traffic (Mbps)':<15}",
+                f"{'-'*12} | {'-'*15}",
+                f"{'In':<12} | {inbound_average / megabit:<15.2f}",
+                f"{'Out':<12} | {outbound_average / megabit:<15.2f}",
+                "",
+                f"{'Connections:':<12} {self.num_connections:>6}",
+                f"{'Total In:':<12} {inbound_total / megabyte:>6.2f} MB",
+                f"{'Total Out:':<12} {outbound_total / megabyte:>6.2f} MB",
+                f"{'Total:':<12} {(inbound_total + outbound_total) / megabyte:>6.2f} MB",
+                "",
+            ]
             if self.num_errors:
-                print(f"Errors: {self.num_errors}")
+                lines.append(f"Errors: {self.num_errors}")
             if self.messages:
-                print("Last 5 log messages:")
-                for msg in self.messages:
-                    print(f"    {msg}")
+                lines.append("Last 5 log messages:")
+                lines.extend(f"    {msg}" for msg in self.messages)
+            text = "\n".join(lines) + "\n"
+
+            # Clear the console and redraw. Do it in a single write: terminals
+            # such as a-Shell's (a web view) pay a lot per write call.
+            if "Pythonista" in sys.executable:
+                console.clear()
+                sys.stdout.write(text)
+            else:
+                sys.stdout.write("\033[H\033[2J" + text)
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
