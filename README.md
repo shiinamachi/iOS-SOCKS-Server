@@ -1,8 +1,17 @@
 # What
 
-A simple HTTP/SOCKS proxy designed to run on Pythonista on iOS, letting you fake-tether your devices to a phone. 
+A simple HTTP/SOCKS proxy designed to run on Pythonista or a-Shell on iOS, letting you fake-tether your devices to a phone. 
 
 # Installation
+
+## a-Shell (free)
+
+- Install [a-Shell](https://apps.apple.com/app/a-shell/id1473805438) from the App Store.
+- Get the code into a-Shell's `~/Documents` folder: either unzip the [GitHub archive](https://github.com/nneonneo/iOS-SOCKS-Server/archive/master.zip) with the Files app and move the folder to *On My iPhone → a-Shell*, or run `lg2 clone https://github.com/nneonneo/iOS-SOCKS-Server` inside a-Shell.
+- Start it with `cd iOS-SOCKS-Server` and `python3 socks5.py`. Stop it with Ctrl-C.
+- Keep a-Shell in the foreground while the proxy runs. iOS suspends apps in the background (and when the screen locks), and every proxied connection stalls until you come back. The script disables screen auto-lock while it runs (set `DISABLE_AUTO_LOCK = False` to turn that off); lowering the brightness saves battery.
+
+## Pythonista
 
 - Install Pythonista from the [App Store](https://apps.apple.com/us/app/pythonista-3/id1085978097). It's a paid app, but it's worth every penny if you are a power user.
 - Download the code from [GitHub](https://github.com/nneonneo/iOS-SOCKS-Server/archive/master.zip).
@@ -33,7 +42,7 @@ For connectivity, you have a few options:
         - If you are using an ad-hoc Wi-Fi network (i.e. Wi-Fi menu -> Create Network), you will need to do some extra setup here. Under the TCP/IP tab, copy the existing 169.254.y.z IPv4 address, then switch Configure IPv4 to Manually, enter the 169.254.y.z IP address in both IPv4 Address and Router, and enter 255.255.0.0 as Subnet Mask. Under the DNS tab, add 169.254.y.z to the DNS Servers list.
         - Make sure you set proxy settings in any other application that is not using the system proxy settings.
     - For Windows or Linux, please follow the appropriate instructions for configuring a proxy on your system. It is recommended that you use the PAC URL if possible (also called a setup script or automatic configuration script).
-        - On Windows, you may consider using the [SSTap](https://sourceforge.net/projects/sstap/) project to force all connections to go through the proxy. Disclaimer: this project does not have any affiliation with SSTap and cannot provide support for any issues that arise from its use.
+        - On Windows, you may consider using [ProxiFyre](https://github.com/wiresock/proxifyre) or the [SSTap](https://sourceforge.net/projects/sstap/) project to force all connections to go through the proxy (see [Using ProxiFyre on Windows](#using-proxifyre-on-windows) below). Disclaimer: this project does not have any affiliation with these projects and cannot provide support for any issues that arise from their use.
     - For Android: open Settings, Wi-Fi, select your network, expand the Advanced Settings, change the proxy setting to Manual, and enter the host and port for the *HTTP proxy*. Note that SOCKS proxy support on Android is limited, even when using the PAC URL, so the HTTP proxy is recommended.
         - Many applications on Android do not respect proxy settings, unfortunately, and in those cases you will have to configure the apps manually or use an app like Proxifier to force apps to use the proxy.
 
@@ -49,7 +58,65 @@ While it's easiest to use this with websites, it's actually possible to tunnel a
 
 `ssh -o ProxyCommand='nc -X 5 -x <IP>:9876 %h %p' user@host`
 
+The SOCKS proxy also supports UDP (`UDP ASSOCIATE`), so tools that redirect all traffic of an application (such as ProxiFyre) can send DNS, QUIC and VPN tunnels through it. The UDP relay listens on the same port number as the SOCKS proxy (9876/udp by default).
+
+# Using ProxiFyre on Windows
+
+[ProxiFyre](https://github.com/wiresock/proxifyre) transparently redirects the TCP and UDP traffic of selected programs to a SOCKS5 proxy. A configuration that sends everything through the phone looks like this (`app-config.json`):
+
+```json
+{
+  "logLevel": "Error",
+  "bypassLan": true,
+  "proxies": [
+    {
+      "appNames": [""],
+      "socks5ProxyEndpoint": "172.20.10.1:9876",
+      "supportedProtocols": ["TCP", "UDP"]
+    }
+  ],
+  "excludes": []
+}
+```
+
+Notes:
+
+- Enable `UDP` in `supportedProtocols`; otherwise DNS, QUIC (HTTP/3) and VPN tunnels of the redirected programs bypass the proxy.
+- If you restart the proxy, connections that were open at that time are dropped, but UDP flows resume as soon as the proxy is back, because the UDP relay port does not change between runs.
+
+## Using a VPN such as Cloudflare WARP / Zero Trust on the PC at the same time
+
+A VPN client on the PC sends its own tunnel (for WARP: UDP for WireGuard/MASQUE, plus some HTTPS) from one service process, `warp-svc.exe`. Pick one of these setups:
+
+- **The hotspot has working Internet access** (tethering is allowed): let the VPN connect directly. Add its process to `excludes` (e.g. `"excludes": ["warp-svc"]`) so ProxiFyre does not touch the tunnel.
+- **The hotspot has no Internet access, or you want the VPN to go through the phone**: proxy only the VPN process, with TCP and UDP, and let the VPN carry the other programs' traffic:
+
+  ```json
+  "proxies": [
+    {
+      "appNames": ["warp-svc"],
+      "socks5ProxyEndpoint": "172.20.10.1:9876",
+      "supportedProtocols": ["TCP", "UDP"]
+    }
+  ]
+  ```
+
+  Avoid the catch-all `""` rule in this setup; otherwise programs whose traffic should go into the VPN are redirected to the proxy as well.
+
+In both cases the VPN must not route the proxy's own address into the tunnel. WARP excludes `172.16.0.0/12` (which contains the hotspot's `172.20.10.0/28`) by default; if your Zero Trust organization changed the Split Tunnels list, make sure the hotspot subnet stays excluded.
+
+Alternatively, run the VPN on the phone instead (with `USE_PHONE_VPN = True`); all proxied traffic then goes through the phone's VPN.
+
 # Troubleshooting
+
+## Connections stall or drop now and then
+
+- Keep the app in the foreground and the screen on (see the installation notes). iOS suspends a backgrounded or locked app within seconds.
+- The cellular address changes from time to time. The proxy notices that within a few seconds (`ADDRESS_CHECK_INTERVAL`) and switches to the new address; you will see an "Outbound address changed" message.
+
+## "Port ... is in use" after restarting
+
+A previous run is still holding the port. The proxy keeps retrying and starts as soon as the port is free. If it does not, quit a-Shell/Pythonista completely (swipe it away in the app switcher) and start it again.
 
 ## Doesn't work with an ad-hoc network on macOS
 
