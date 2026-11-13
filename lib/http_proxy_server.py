@@ -31,6 +31,13 @@ class AsyncHTTPProxyHandler(AsyncProxyHandler, BaseHTTPRequestHandler):
         self.wfile = writer
 
     async def handle(self):
+        try:
+            await self._handle()
+        finally:
+            if not self.writer.is_closing():
+                self.writer.close()
+
+    async def _handle(self):
         self.raw_requestline = await self.reader.readline()
         if not self.raw_requestline:
             return
@@ -125,23 +132,21 @@ class AsyncHTTPProxyHandler(AsyncProxyHandler, BaseHTTPRequestHandler):
 
         self.log_request()
 
-        s_reader, s_writer = connection
         headers = copy.copy(self.headers)
         headers["Connection"] = "close"
         del headers["Proxy-Connection"]
-        s_writer.write(
-            (
-                "%s %s %s\r\n"
-                % (
-                    self.command,
-                    parse.urlunparse(("", "", path, params, query, "")),
-                    self.request_version,
-                )
-            ).encode("utf8")
-        )
+        request = [
+            "%s %s %s\r\n"
+            % (
+                self.command,
+                parse.urlunparse(("", "", path, params, query, "")),
+                self.request_version,
+            )
+        ]
         for k, v in headers.items():
-            s_writer.write(("%s: %s\r\n" % (k, v)).encode("utf8"))
-        s_writer.write(b"\r\n")
+            request.append("%s: %s\r\n" % (k, v))
+        request.append("\r\n")
+        connection.transport.write("".join(request).encode("utf8"))
 
         # Simple, dumb proxy: don't interpret upstream response, just forward it onto
         # the client and close the connection at the end.

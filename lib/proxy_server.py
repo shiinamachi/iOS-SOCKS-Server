@@ -6,12 +6,14 @@ import socket
 from asyncio.staggered import staggered_race
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, Sequence, Type, Optional
+from typing import Sequence, Type, Optional
 
 from . import status
+from .relay import RelayProtocol, adopt_transport, relay
 
 SocketAddress = tuple[str, int]
-Connection = tuple[asyncio.StreamReader, asyncio.StreamWriter]
+# An established, not yet relayed, upstream connection.
+Connection = RelayProtocol
 
 
 def af_by_address(domain: str) -> int | None:
@@ -36,24 +38,6 @@ class GenericAddress:
 
 HAPPY_EYEBALLS_DELAY = 0.05  # seconds
 CONNECT_TIMEOUT = 75  # seconds
-
-
-async def forwarder_loop(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    stat_fn: Callable[[int], None],
-) -> None:
-    try:
-        while 1:
-            buf = await reader.read(65536)
-            if not buf:
-                break
-            stat_fn(len(buf))
-            writer.write(buf)
-            await writer.drain()
-    finally:
-        writer.close()
-        await writer.wait_closed()
 
 
 # XXX: should make this a more generic address type enum and convert from socks5
@@ -127,17 +111,31 @@ class AsyncProxyHandler:
         else:
             self.log_tag = "[%s]" % (peer_addr,)
 
-    async def tcp_forward(self, connection: Connection) -> None:
-        s_reader, s_writer = connection
-        await asyncio.gather(
-            forwarder_loop(
-                s_reader, self.writer, self.server.traffic_stats.add_inbound
-            ),
-            forwarder_loop(
-                self.reader, s_writer, self.server.traffic_stats.add_outbound
-            ),
-            return_exceptions=True,
+    async def tcp_forward(self, upstream: Connection) -> None:
+        """Relay data between the client and `upstream` until both close."""
+        server = self.server
+        transport = self.writer.transport
+        if transport.is_closing():
+            # The client went away while we were connecting.
+            upstream.transport.abort()
+            return
+
+        # Take the client connection over from asyncio streams. Anything the
+        # client already sent (e.g. a TLS ClientHello sent right after the
+        # CONNECT request) is still in the StreamReader buffer.
+        buffered = bytes(self.reader._buffer)
+        self.reader._buffer.clear()
+        client = adopt_transport(
+            transport,
+            server.traffic_stats.add_outbound,
+            buffered=buffered,
+            eof=self.reader.at_eof(),
         )
+        server.track_transport(upstream.transport)
+        try:
+            await relay(client, upstream, server.idle_timeout)
+        finally:
+            server.untrack_transport(upstream.transport)
 
     async def handle(self) -> None:
         pass
@@ -153,8 +151,10 @@ class AsyncProxyServer:
         resolver: Optional["dns.asyncresolver.Resolver"] = None,
         connect_host_ipv4: str | None = None,
         connect_host_ipv6: str | None = None,
+        idle_timeout: float | None = None,
     ):
         self.handler_class = handler_class
+        self.idle_timeout = idle_timeout
         self.listen_hosts = listen_hosts
         self.listen_port = listen_port
         self.traffic_stats = traffic_stats or status.SimpleTrafficStats()
@@ -211,23 +211,27 @@ class AsyncProxyServer:
             self.untrack_transport(writer.transport)
             self.traffic_stats.remove_connection()
 
-    async def ipv4_connect(self, address: SocketAddress) -> Connection:
-        local_addr = (
-            (self.connect_host_ipv4, 0) if self.connect_host_ipv4 is not None else None
-        )
-        return await asyncio.wait_for(
-            asyncio.open_connection(address[0], address[1], local_addr=local_addr),
+    async def _open_connection(
+        self, address: SocketAddress, local_host: str | None
+    ) -> Connection:
+        loop = asyncio.get_running_loop()
+        local_addr = (local_host, 0) if local_host is not None else None
+        _, protocol = await asyncio.wait_for(
+            loop.create_connection(
+                lambda: RelayProtocol(self.traffic_stats.add_inbound),
+                address[0],
+                address[1],
+                local_addr=local_addr,
+            ),
             timeout=CONNECT_TIMEOUT,
         )
+        return protocol
+
+    async def ipv4_connect(self, address: SocketAddress) -> Connection:
+        return await self._open_connection(address, self.connect_host_ipv4)
 
     async def ipv6_connect(self, address: SocketAddress) -> Connection:
-        local_addr = (
-            (self.connect_host_ipv6, 0) if self.connect_host_ipv6 is not None else None
-        )
-        return await asyncio.wait_for(
-            asyncio.open_connection(address[0], address[1], local_addr=local_addr),
-            timeout=CONNECT_TIMEOUT,
-        )
+        return await self._open_connection(address, self.connect_host_ipv6)
 
     async def tcp_connect(
         self, address_type: int, address: SocketAddress
