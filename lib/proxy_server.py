@@ -1,6 +1,8 @@
 """ General base class for proxies """
 
 import asyncio
+import errno
+import logging
 import random
 import socket
 from asyncio.staggered import staggered_race
@@ -10,6 +12,8 @@ from typing import Sequence, Type, Optional
 
 from . import status
 from .relay import RelayProtocol, adopt_transport, relay
+
+logger = logging.getLogger("proxy")
 
 SocketAddress = tuple[str, int]
 # An established, not yet relayed, upstream connection.
@@ -50,20 +54,28 @@ class Socks5AddressType(IntEnum):
 class CustomSourceAddressResolver:
     def __init__(self, resolver: "dns.asyncresolver.Resolver", connect_host_ipv4: str | None, connect_host_ipv6: str | None):
         self.resolver = resolver
+        self.all_nameservers = list(resolver.nameservers)
         self.resolver_source: str | None = None
-        if connect_host_ipv4 is not None or connect_host_ipv6 is not None:
-            resolvers_by_af: dict[int, list[str]] = {socket.AF_INET: [], socket.AF_INET6: []}
-            for ns in self.resolver.nameservers:
-                resolvers_by_af[af_by_address(ns)].append(ns)
+        self.set_source(connect_host_ipv4, connect_host_ipv6)
 
-            if resolvers_by_af[socket.AF_INET] and connect_host_ipv4 is not None:
-                self.resolver_source = connect_host_ipv4
-                self.resolver.nameservers = resolvers_by_af[socket.AF_INET]
-            elif resolvers_by_af[socket.AF_INET6] and connect_host_ipv6 is not None:
-                self.resolver_source = connect_host_ipv6
-                self.resolver.nameservers = resolvers_by_af[socket.AF_INET6]
-            else:
-                raise Exception("Resolver does not have any suitable nameservers!")
+    def set_source(self, connect_host_ipv4: str | None, connect_host_ipv6: str | None) -> None:
+        if connect_host_ipv4 is None and connect_host_ipv6 is None:
+            self.resolver_source = None
+            self.resolver.nameservers = self.all_nameservers
+            return
+
+        resolvers_by_af: dict[int, list[str]] = {socket.AF_INET: [], socket.AF_INET6: []}
+        for ns in self.all_nameservers:
+            resolvers_by_af[af_by_address(ns)].append(ns)
+
+        if resolvers_by_af[socket.AF_INET] and connect_host_ipv4 is not None:
+            self.resolver_source = connect_host_ipv4
+            self.resolver.nameservers = resolvers_by_af[socket.AF_INET]
+        elif resolvers_by_af[socket.AF_INET6] and connect_host_ipv6 is not None:
+            self.resolver_source = connect_host_ipv6
+            self.resolver.nameservers = resolvers_by_af[socket.AF_INET6]
+        else:
+            raise Exception("Resolver does not have any suitable nameservers!")
 
     async def resolve_ipv4(self, domain):
         answer = await self.resolver.resolve(
@@ -152,9 +164,13 @@ class AsyncProxyServer:
         connect_host_ipv4: str | None = None,
         connect_host_ipv6: str | None = None,
         idle_timeout: float | None = None,
+        address_error: asyncio.Event | None = None,
     ):
         self.handler_class = handler_class
         self.idle_timeout = idle_timeout
+        # Set when binding to the outbound address fails, so that the address
+        # watcher re-checks the interfaces right away.
+        self.address_error = address_error
         self.listen_hosts = listen_hosts
         self.listen_port = listen_port
         self.traffic_stats = traffic_stats or status.SimpleTrafficStats()
@@ -179,6 +195,17 @@ class AsyncProxyServer:
             await self._server.serve_forever()
         finally:
             self.close()
+
+    def set_connect_hosts(self, ipv4: str | None, ipv6: str | None) -> None:
+        """Switch outbound traffic to new local addresses (e.g. after the
+        cellular address changed). Existing connections are not affected."""
+        if isinstance(self.resolver, CustomSourceAddressResolver):
+            try:
+                self.resolver.set_source(ipv4, ipv6)
+            except Exception as e:
+                logger.warning("Keeping old DNS source address: %s", e)
+        self.connect_host_ipv4 = ipv4
+        self.connect_host_ipv6 = ipv6
 
     def close(self) -> None:
         """Stop listening and drop every open connection.
@@ -216,15 +243,21 @@ class AsyncProxyServer:
     ) -> Connection:
         loop = asyncio.get_running_loop()
         local_addr = (local_host, 0) if local_host is not None else None
-        _, protocol = await asyncio.wait_for(
-            loop.create_connection(
-                lambda: RelayProtocol(self.traffic_stats.add_inbound),
-                address[0],
-                address[1],
-                local_addr=local_addr,
-            ),
-            timeout=CONNECT_TIMEOUT,
-        )
+        try:
+            _, protocol = await asyncio.wait_for(
+                loop.create_connection(
+                    lambda: RelayProtocol(self.traffic_stats.add_inbound),
+                    address[0],
+                    address[1],
+                    local_addr=local_addr,
+                ),
+                timeout=CONNECT_TIMEOUT,
+            )
+        except OSError as e:
+            if e.errno == errno.EADDRNOTAVAIL and self.address_error is not None:
+                # Our outbound address is gone; have it re-detected now.
+                self.address_error.set()
+            raise
         return protocol
 
     async def ipv4_connect(self, address: SocketAddress) -> Connection:
