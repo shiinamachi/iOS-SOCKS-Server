@@ -308,32 +308,37 @@ if __name__ == "__main__":
     thread.start()
 
     async def main():
-        server = AsyncProxyServer(
-            AsyncSocks5Handler,
-            listen_hosts=LISTEN_HOST,
-            listen_port=SOCKS_PORT,
-            traffic_stats=stats,
-            resolver=resolver,
-            connect_host_ipv4=CONNECT_HOST_IPV4,
-            connect_host_ipv6=CONNECT_HOST_IPV6,
-        )
-        asyncio.create_task(server.run())
-
-        server = AsyncProxyServer(
-            AsyncHTTPProxyHandler,
-            listen_hosts=LISTEN_HOST,
-            listen_port=HTTP_PORT,
-            traffic_stats=stats,
-            resolver=resolver,
-            connect_host_ipv4=CONNECT_HOST_IPV4,
-            connect_host_ipv6=CONNECT_HOST_IPV6,
-        )
-        asyncio.create_task(server.run())
-
-        await stats.render_forever()
+        servers = [
+            AsyncProxyServer(
+                handler_class,
+                listen_hosts=LISTEN_HOST,
+                listen_port=port,
+                traffic_stats=stats,
+                resolver=resolver,
+                connect_host_ipv4=CONNECT_HOST_IPV4,
+                connect_host_ipv6=CONNECT_HOST_IPV6,
+            )
+            for handler_class, port in (
+                (AsyncSocks5Handler, SOCKS_PORT),
+                (AsyncHTTPProxyHandler, HTTP_PORT),
+            )
+        ]
+        # Keep references to the tasks so they are not garbage collected.
+        tasks = [asyncio.create_task(server.run()) for server in servers]
+        try:
+            await stats.render_forever()
+        finally:
+            for server in servers:
+                server.close()
+            for task in tasks:
+                task.cancel()
 
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Shutting down.")
+    finally:
         wpad_server.shutdown()
+        # Release the listening socket; otherwise it leaks inside a-Shell's
+        # process and the next run cannot bind the WPAD port.
+        wpad_server.server_close()

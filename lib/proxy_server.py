@@ -165,24 +165,50 @@ class AsyncProxyServer:
             self.resolver = DefaultAddressResolver()
         self.connect_host_ipv4 = connect_host_ipv4
         self.connect_host_ipv6 = connect_host_ipv6
+        self._server: asyncio.AbstractServer | None = None
+        self._transports: set[asyncio.BaseTransport] = set()
 
     async def run(self) -> None:
-        server = await asyncio.start_server(
+        self._server = await asyncio.start_server(
             self.client_connected,
             host=self.listen_hosts,
             port=self.listen_port,
             reuse_address=True,
         )
-        await server.serve_forever()
+        try:
+            await self._server.serve_forever()
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Stop listening and drop every open connection.
+
+        a-Shell runs Python inside the app process, so anything left open here
+        survives the script and keeps the ports busy until the app is killed.
+        """
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        for transport in list(self._transports):
+            transport.abort()
+        self._transports.clear()
+
+    def track_transport(self, transport: asyncio.BaseTransport) -> None:
+        self._transports.add(transport)
+
+    def untrack_transport(self, transport: asyncio.BaseTransport) -> None:
+        self._transports.discard(transport)
 
     async def client_connected(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         handler = self.handler_class(reader, writer, server=self)
         self.traffic_stats.add_connection()
+        self.track_transport(writer.transport)
         try:
             await handler.handle()
         finally:
+            self.untrack_transport(writer.transport)
             self.traffic_stats.remove_connection()
 
     async def ipv4_connect(self, address: SocketAddress) -> Connection:
