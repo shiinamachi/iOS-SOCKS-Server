@@ -10,12 +10,43 @@ data keeps flowing in the other direction until that side finishes too.
 """
 
 import asyncio
+import socket
 from typing import Callable, Optional
 
 # Per-direction user-space buffer before reading from the other side pauses.
 WRITE_BUFFER_HIGH = 256 * 1024
 # How often idle connections are checked (seconds, upper bound).
 IDLE_CHECK_INTERVAL = 30.0
+
+# TCP keepalive: probe after this much idle time, then every KEEPALIVE_INTERVAL,
+# giving up after KEEPALIVE_COUNT unanswered probes (~2 minutes in total).
+# This detects peers that vanished without closing (e.g. a client that left the
+# hotspot) and keeps carrier NAT mappings alive for long-lived idle connections.
+KEEPALIVE_IDLE = 60
+KEEPALIVE_INTERVAL = 15
+KEEPALIVE_COUNT = 4
+
+
+def enable_keepalive(transport: asyncio.BaseTransport) -> None:
+    sock = transport.get_extra_info("socket")
+    if sock is None:
+        return
+    # TCP_KEEPALIVE is the macOS/iOS name of the idle-time option.
+    idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+        socket, "TCP_KEEPALIVE", None
+    )
+    for level, opt, value in (
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, idle_opt, KEEPALIVE_IDLE),
+        (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", None), KEEPALIVE_INTERVAL),
+        (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", None), KEEPALIVE_COUNT),
+    ):
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(level, opt, value)
+        except OSError:
+            pass
 
 
 class RelayProtocol(asyncio.Protocol):
@@ -37,6 +68,7 @@ class RelayProtocol(asyncio.Protocol):
         assert isinstance(transport, asyncio.Transport)
         self.transport = transport
         transport.set_write_buffer_limits(high=WRITE_BUFFER_HIGH)
+        enable_keepalive(transport)
 
     def data_received(self, data: bytes) -> None:
         self.activity += 1

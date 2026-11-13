@@ -29,7 +29,7 @@ PROXY_HOST = "172.20.10.1"
 # IP over which the proxy will attempt to connect to the Internet (will be autodetected from available networks)
 CONNECT_HOST_IPV4 = "0.0.0.0"
 CONNECT_HOST_IPV6 = None
-# Time out connections after being idle for this long (in seconds)
+# Time out connections after being idle for this long (in seconds; None to disable)
 IDLE_TIMEOUT = 1800
 # Host to listen on - 0.0.0.0 to listen on all interfaces
 LISTEN_HOST = "0.0.0.0"
@@ -317,6 +317,7 @@ if __name__ == "__main__":
                 resolver=resolver,
                 connect_host_ipv4=CONNECT_HOST_IPV4,
                 connect_host_ipv6=CONNECT_HOST_IPV6,
+                idle_timeout=IDLE_TIMEOUT,
             )
             for handler_class, port in (
                 (AsyncSocks5Handler, SOCKS_PORT),
