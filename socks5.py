@@ -39,6 +39,10 @@ SOCKS_PORT = 9876 # SOCKS5 server
 HTTP_PORT = 9877 # HTTP Proxy server
 WPAD_PORT = 8088 # WPAD proxy autodiscovery server
 
+# Keep the screen from auto-locking while running (Pythonista and a-Shell).
+# When the screen locks, iOS suspends the app and every connection stalls.
+DISABLE_AUTO_LOCK = True
+
 USE_PHONE_VPN = True
 # VPNs tend to ship their own DNS resolvers; since iOS will send all traffic
 # via the VPN by default, we can trust the system DNS if using the phone VPN.
@@ -46,16 +50,6 @@ USE_SYSTEM_DNS = USE_PHONE_VPN
 CUSTOM_RESOLVERS = []
 
 ## End of configuration
-
-# Try to keep the screen from turning off (iOS)
-try:
-    import console
-    from objc_util import on_main_thread
-
-    on_main_thread(console.set_idle_timer_disabled)(True)
-except ImportError:
-    pass
-
 
 DEFAULT_RESOLVERS = [
     "1.0.0.1",
@@ -243,6 +237,12 @@ if __name__ == "__main__":
     initial_output += "HTTP Proxy Address: {}:{}\n".format(
         PROXY_HOST or LISTEN_HOST, HTTP_PORT
     )
+    # Keep the screen from locking: once it locks, iOS suspends the app and
+    # all proxied connections stall.
+    from lib import ios
+
+    if DISABLE_AUTO_LOCK and ios.set_idle_timer_disabled(True):
+        initial_output += "Screen auto-lock is disabled while the proxy runs.\n"
     stats = StatusMonitor(initial_output)
     logging.getLogger().addHandler(stats)
 
@@ -288,6 +288,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Shutting down.")
     finally:
+        if DISABLE_AUTO_LOCK:
+            ios.set_idle_timer_disabled(False)
         wpad_server.shutdown()
         # Release the listening socket; otherwise it leaks inside a-Shell's
         # process and the next run cannot bind the WPAD port.
