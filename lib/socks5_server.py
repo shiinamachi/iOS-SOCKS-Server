@@ -144,7 +144,7 @@ class UdpForwarder:
         client_addr = self.connections.get((transport, addr), None)
         if client_addr is None:
             logging.warning(
-                "%s: got packet from unknown sender %s", self.log_tag, *addr
+                "%s: got packet from unknown sender %s", self.log_tag, addr
             )
             return
 

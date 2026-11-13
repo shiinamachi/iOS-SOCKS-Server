@@ -218,11 +218,10 @@ try:
             )
             # Test IPv6 connectivity
             try:
-                test_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-                test_socket.settimeout(5)
-                test_socket.bind((iface_ipv6.addr.address, 0))
-                test_socket.connect(("2606:4700:4700::1111", 80))
-                test_socket.close()
+                with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as test_socket:
+                    test_socket.settimeout(5)
+                    test_socket.bind((iface_ipv6.addr.address, 0))
+                    test_socket.connect(("2606:4700:4700::1111", 80))
                 CONNECT_HOST_IPV6 = iface_ipv6.addr.address
             except Exception as e:
                 ipv6_output += (
@@ -230,13 +229,11 @@ try:
                     % str(e)
                 )
                 CONNECT_HOST_IPV6 = None
-            finally:
-                test_socket.close()
 
     initial_output += ipv4_output + ipv6_output
     print(initial_output)
 except Exception as e:
-    logging.error("Address detection failed: %s: %s", (type(e).__name__, e))
+    logging.error("Address detection failed: %s: %s", type(e).__name__, e)
     import traceback
 
     traceback.print_exc()
