@@ -227,6 +227,12 @@ def run_wpad_server(server):
 
 if __name__ == "__main__":
     import asyncio
+    import sys
+
+    if sys.platform == "win32":
+        # The UDP relay needs loop.add_reader(), which the default Windows
+        # (proactor) loop lacks. Only relevant when testing on Windows.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     wpad_server = create_wpad_server(LISTEN_HOST, WPAD_PORT, PROXY_HOST, SOCKS_PORT)
 

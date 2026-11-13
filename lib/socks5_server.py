@@ -8,8 +8,7 @@ import logging
 import socket
 import struct
 from enum import IntEnum
-from io import BytesIO
-from typing import Any, BinaryIO, Callable, Coroutine
+from typing import Any
 
 from . import status
 from .proxy_server import (
@@ -18,6 +17,7 @@ from .proxy_server import (
     SocketAddress,
     Socks5AddressType,
 )
+from .udp_relay import unmap_ipv4
 
 logger = logging.getLogger("socks5")
 
@@ -51,140 +51,9 @@ def encode_address(sockaddr: SocketAddress | None = None) -> bytes:
         return struct.pack("!B16sH", Socks5AddressType.IPV6, addrbytes, port)
 
 
-class UdpForwarderProtocol(asyncio.DatagramProtocol):
-    def __init__(
-        self,
-        method: Callable[
-            [asyncio.DatagramTransport, bytes, SocketAddress],
-            Coroutine[None, None, None],
-        ],
-    ):
-        self.method = method
-        self.loop = asyncio.get_running_loop()
-
-    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
-        self.transport = transport
-
-    def datagram_received(self, data: bytes, addr: SocketAddress) -> None:
-        self.loop.create_task(self.method(self.transport, data, addr[:2]))
-
-
-class UdpForwarder:
-    def __init__(self, log_tag: str, server: "AsyncProxyServer", local_address: str):
-        self.log_tag = log_tag + " [udp]"
-        self.server = server
-        self.local_address = local_address
-        self.server_conn_ipv4: asyncio.DatagramTransport | None = None
-        self.server_conn_ipv6: asyncio.DatagramTransport | None = None
-        self.connections: dict[
-            tuple[asyncio.DatagramTransport, SocketAddress], SocketAddress
-        ] = {}
-
-    async def start(self) -> None:
-        loop = asyncio.get_running_loop()
-        self.client_conn, _ = await loop.create_datagram_endpoint(
-            lambda: UdpForwarderProtocol(self.on_client_datagram),
-            local_addr=(self.local_address, 0),
-        )
-
-        connect_host_ipv4 = self.server.connect_host_ipv4
-        connect_host_ipv6 = self.server.connect_host_ipv6
-
-        if connect_host_ipv4 is None and connect_host_ipv6 is None:
-            connect_host_ipv4 = "0.0.0.0"
-            connect_host_ipv6 = "::"
-
-        if connect_host_ipv4 is not None:
-            self.server_conn_ipv4, _ = await loop.create_datagram_endpoint(
-                lambda: UdpForwarderProtocol(self.on_server_datagram),
-                local_addr=(connect_host_ipv4, 0),
-            )
-
-        if connect_host_ipv6 is not None:
-            self.server_conn_ipv6, _ = await loop.create_datagram_endpoint(
-                lambda: UdpForwarderProtocol(self.on_server_datagram),
-                local_addr=(connect_host_ipv6, 0),
-            )
-
-    async def on_client_datagram(
-        self,
-        transport: asyncio.DatagramTransport,
-        data: bytes,
-        client_addr: SocketAddress,
-    ) -> None:
-        sockfile = BytesIO(data)
-        try:
-            # decode header
-            _, frag, address_type = self.readstruct(sockfile, "!HBB")
-            assert frag == 0, "UDP fragmentation is not supported"
-            address = self.read_addrport(address_type, sockfile)
-            assert address is not None, "Address type is not supported"
-            payload = sockfile.read()
-            self.server.traffic_stats.add_outbound(len(payload))
-
-            resolved = await self.server.resolve_address(address_type, address)
-            if resolved.ipv6 and self.server_conn_ipv6:
-                self.connections[self.server_conn_ipv6, resolved.ipv6] = client_addr
-                self.server_conn_ipv6.sendto(payload, resolved.ipv6)
-            elif resolved.ipv4 and self.server_conn_ipv4:
-                self.connections[self.server_conn_ipv4, resolved.ipv4] = client_addr
-                self.server_conn_ipv4.sendto(payload, resolved.ipv4)
-            else:
-                logging.info(
-                    "%s: unable to send UDP packet to %s", self.log_tag, address
-                )
-        except Exception as e:
-            logging.info("%s: malformed udp packet: %s", self.log_tag, e)
-
-    async def on_server_datagram(
-        self, transport: asyncio.DatagramTransport, data: bytes, addr: SocketAddress
-    ) -> None:
-        self.server.traffic_stats.add_inbound(len(data))
-
-        client_addr = self.connections.get((transport, addr), None)
-        if client_addr is None:
-            logging.warning(
-                "%s: got packet from unknown sender %s", self.log_tag, addr
-            )
-            return
-
-        header = struct.pack("!HB", 0, 0) + encode_address(addr)
-        self.client_conn.sendto(header + data, client_addr)
-
-    def readall(self, f: BinaryIO, n: int) -> bytes:
-        res = bytearray()
-        while len(res) < n:
-            chunk = f.read(n - len(res))
-            if not chunk:
-                raise EOFError()
-            res += chunk
-        return bytes(res)
-
-    def readstruct(self, f: BinaryIO, fmt: str) -> tuple[Any, ...]:
-        return struct.unpack(fmt, self.readall(f, struct.calcsize(fmt)))
-
-    def read_addrport(self, address_type: int, sockf: BinaryIO) -> SocketAddress | None:
-        if address_type == Socks5AddressType.IPV4:
-            address = socket.inet_ntop(socket.AF_INET, self.readall(sockf, 4))
-        elif address_type == Socks5AddressType.DOMAIN:
-            domain_length = ord(self.readall(sockf, 1))
-            address = self.readall(sockf, domain_length).decode()
-        elif address_type == Socks5AddressType.IPV6:
-            address = socket.inet_ntop(socket.AF_INET6, self.readall(sockf, 16))
-        else:
-            return None
-        (port,) = self.readstruct(sockf, "!H")
-        return address, port
-
-    def close(self) -> None:
-        self.client_conn.close()
-        if self.server_conn_ipv4:
-            self.server_conn_ipv4.close()
-        if self.server_conn_ipv6:
-            self.server_conn_ipv6.close()
-
-
 class AsyncSocks5Handler(AsyncProxyHandler):
+    uses_udp_relay = True
+
     def send_reply(
         self, status: Socks5Status, bindaddr: tuple[str, int] | None = None
     ) -> None:
@@ -276,26 +145,24 @@ class AsyncSocks5Handler(AsyncProxyHandler):
         await self.tcp_forward(connection)
 
     async def handle_udp(self, client_address: SocketAddress) -> None:
-        csock_addr = self.writer.get_extra_info("sockname")[0]
-
-        # TODO: restrict incoming packets to client address
+        local_ip = unmap_ipv4(self.writer.get_extra_info("sockname")[0])
+        client_ip = unmap_ipv4(client_address[0])
+        relay = self.server.udp_relay
         try:
-            udp_forwarder = UdpForwarder(self.log_tag, self.server, csock_addr)
-            await udp_forwarder.start()
+            endpoint = relay.associate(local_ip, client_ip)
         except Exception as e:
             self.send_reply(Socks5Status.ERROR)
             raise e
 
-        csock_port = udp_forwarder.client_conn.get_extra_info("sockname")[1]
-
-        self.send_reply(Socks5Status.SUCCEEDED, (csock_addr, csock_port))
+        self.send_reply(Socks5Status.SUCCEEDED, (local_ip, endpoint.port))
         try:
+            # The association lives as long as the control connection.
             while True:
                 chunk = await self.reader.read(4096)
                 if not chunk:
                     break
         finally:
-            udp_forwarder.close()
+            relay.release(endpoint, client_ip)
 
 
 if __name__ == "__main__":

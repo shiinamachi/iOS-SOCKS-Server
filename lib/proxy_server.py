@@ -113,6 +113,9 @@ class DefaultAddressResolver:
 
 
 class AsyncProxyHandler:
+    # Whether the server should bind the SOCKS5 UDP relay port on startup.
+    uses_udp_relay = False
+
     def __init__(
         self,
         reader: asyncio.StreamReader,
@@ -194,6 +197,7 @@ class AsyncProxyServer:
         self.connect_host_ipv4 = connect_host_ipv4
         self.connect_host_ipv6 = connect_host_ipv6
         self._server: asyncio.AbstractServer | None = None
+        self._udp_relay = None
         self._transports: set[asyncio.BaseTransport] = set()
 
     async def run(self) -> None:
@@ -203,6 +207,15 @@ class AsyncProxyServer:
             port=self.listen_port,
             reuse_address=True,
         )
+        if self.handler_class.uses_udp_relay:
+            hosts = (
+                [self.listen_hosts]
+                if isinstance(self.listen_hosts, str)
+                else self.listen_hosts
+            )
+            for family in {af_by_address(host) for host in hosts}:
+                if family is not None:
+                    self.udp_relay.open_shared(family)
         try:
             await self._server.serve_forever()
         finally:
@@ -219,6 +232,16 @@ class AsyncProxyServer:
         self.connect_host_ipv4 = ipv4
         self.connect_host_ipv6 = ipv6
 
+    @property
+    def udp_relay(self) -> "UdpRelay":
+        """UDP ASSOCIATE relay, created on first use. Its fixed UDP port is the
+        same number as our TCP port."""
+        if self._udp_relay is None:
+            from .udp_relay import UdpRelay
+
+            self._udp_relay = UdpRelay(self, self.listen_port)
+        return self._udp_relay
+
     def close(self) -> None:
         """Stop listening and drop every open connection.
 
@@ -231,6 +254,9 @@ class AsyncProxyServer:
         for transport in list(self._transports):
             transport.abort()
         self._transports.clear()
+        if self._udp_relay is not None:
+            self._udp_relay.close()
+            self._udp_relay = None
 
     def track_transport(self, transport: asyncio.BaseTransport) -> None:
         self._transports.add(transport)
