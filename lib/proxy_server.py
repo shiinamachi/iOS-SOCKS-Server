@@ -42,6 +42,7 @@ class GenericAddress:
 
 HAPPY_EYEBALLS_DELAY = 0.05  # seconds
 CONNECT_TIMEOUT = 75  # seconds
+RESOLVE_TIMEOUT = 10  # seconds
 
 
 # XXX: should make this a more generic address type enum and convert from socks5
@@ -91,13 +92,24 @@ class CustomSourceAddressResolver:
 
 
 class DefaultAddressResolver:
-    async def resolve_ipv4(self, addr):
-        info = await asyncio.get_running_loop().getaddrinfo(addr, None, family=socket.AF_INET)
+    """Resolve with the system resolver (getaddrinfo in a worker thread)."""
+
+    async def _resolve(self, addr, family):
+        # getaddrinfo cannot be cancelled, but don't let a stuck lookup (e.g.
+        # while the phone switches networks) hold the connection forever.
+        info = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(
+                addr, None, family=family, type=socket.SOCK_STREAM
+            ),
+            timeout=RESOLVE_TIMEOUT,
+        )
         return list({item[4][0] for item in info})
 
+    async def resolve_ipv4(self, addr):
+        return await self._resolve(addr, socket.AF_INET)
+
     async def resolve_ipv6(self, addr):
-        info = await asyncio.get_running_loop().getaddrinfo(addr, None, family=socket.AF_INET6)
-        return list({item[4][0] for item in info})
+        return await self._resolve(addr, socket.AF_INET6)
 
 
 class AsyncProxyHandler:
