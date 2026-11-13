@@ -43,6 +43,7 @@ class GenericAddress:
 HAPPY_EYEBALLS_DELAY = 0.05  # seconds
 CONNECT_TIMEOUT = 75  # seconds
 RESOLVE_TIMEOUT = 10  # seconds
+BIND_RETRY_INTERVAL = 2  # seconds
 
 
 # XXX: should make this a more generic address type enum and convert from socks5
@@ -200,13 +201,41 @@ class AsyncProxyServer:
         self._udp_relay = None
         self._transports: set[asyncio.BaseTransport] = set()
 
+    async def _listen(self) -> asyncio.AbstractServer:
+        """Bind the listening socket, retrying while the port is busy.
+
+        A failed bind used to end this task silently, so the proxy looked
+        alive but accepted nothing. A previous run that is still shutting
+        down (or a socket leaked inside a-Shell's process) can hold the port
+        for a while; keep retrying and say so on the status screen.
+        """
+        warned = False
+        while True:
+            try:
+                server = await asyncio.start_server(
+                    self.client_connected,
+                    host=self.listen_hosts,
+                    port=self.listen_port,
+                    reuse_address=True,
+                )
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE:
+                    logger.error("Cannot listen on port %d: %s", self.listen_port, e)
+                    raise
+                if not warned:
+                    logger.error(
+                        "Port %d is in use (previous run still open?); retrying...",
+                        self.listen_port,
+                    )
+                    warned = True
+                await asyncio.sleep(BIND_RETRY_INTERVAL)
+                continue
+            if warned:
+                logger.warning("Listening on port %d", self.listen_port)
+            return server
+
     async def run(self) -> None:
-        self._server = await asyncio.start_server(
-            self.client_connected,
-            host=self.listen_hosts,
-            port=self.listen_port,
-            reuse_address=True,
-        )
+        self._server = await self._listen()
         if self.handler_class.uses_udp_relay:
             hosts = (
                 [self.listen_hosts]

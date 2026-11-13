@@ -228,9 +228,18 @@ if __name__ == "__main__":
         # (proactor) loop lacks. Only relevant when testing on Windows.
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    wpad_server = create_wpad_server(LISTEN_HOST, WPAD_PORT, PROXY_HOST, SOCKS_PORT)
+    try:
+        wpad_server = create_wpad_server(LISTEN_HOST, WPAD_PORT, PROXY_HOST, SOCKS_PORT)
+        initial_output += "PAC URL: http://{}:{}/wpad.dat\n".format(
+            PROXY_HOST, WPAD_PORT
+        )
+    except OSError as e:
+        # Only PAC clients need this; don't let it take the proxy down.
+        wpad_server = None
+        initial_output += "Warning: PAC server unavailable on port {}: {}\n".format(
+            WPAD_PORT, e
+        )
 
-    initial_output += "PAC URL: http://{}:{}/wpad.dat\n".format(PROXY_HOST, WPAD_PORT)
     initial_output += "SOCKS Address: {}:{}\n".format(
         PROXY_HOST or LISTEN_HOST, SOCKS_PORT
     )
@@ -246,9 +255,10 @@ if __name__ == "__main__":
     stats = StatusMonitor(initial_output)
     logging.getLogger().addHandler(stats)
 
-    thread = threading.Thread(target=run_wpad_server, args=(wpad_server,))
-    thread.daemon = True
-    thread.start()
+    if wpad_server is not None:
+        thread = threading.Thread(target=run_wpad_server, args=(wpad_server,))
+        thread.daemon = True
+        thread.start()
 
     async def main():
         address_error = asyncio.Event()
@@ -290,7 +300,8 @@ if __name__ == "__main__":
     finally:
         if DISABLE_AUTO_LOCK:
             ios.set_idle_timer_disabled(False)
-        wpad_server.shutdown()
-        # Release the listening socket; otherwise it leaks inside a-Shell's
-        # process and the next run cannot bind the WPAD port.
-        wpad_server.server_close()
+        if wpad_server is not None:
+            wpad_server.shutdown()
+            # Release the listening socket; otherwise it leaks inside a-Shell's
+            # process and the next run cannot bind the WPAD port.
+            wpad_server.server_close()
